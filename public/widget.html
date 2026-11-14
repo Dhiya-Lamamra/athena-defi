@@ -1,0 +1,255 @@
+<!--
+  Widget générique : affiche n'importe quelle liste au format
+  { titre, valeurLabel, source, sourceUrl, recupereLe, outil, arguments,
+    controles, total, items: [{ id, nom, valeur, date, lien, lat, lon, details }] }
+
+  Interactions :
+  - menus déroulants (controles) -> rappellent l'outil MCP avec window.openai.callTool
+  - recherche texte, tri, filtre valeur minimale (côté widget)
+  - mini-carte cliquable si les items ont lat/lon
+  - clic sur une ligne -> détails
+-->
+<div id="app">
+  <header>
+    <div>
+      <h2 id="titre">Chargement…</h2>
+      <p id="sousTitre" class="muted"></p>
+    </div>
+    <button id="rafraichir" type="button" title="Récupérer les données à nouveau">↻ Rafraîchir</button>
+  </header>
+
+  <section id="controles" class="barre"></section>
+
+  <section class="barre">
+    <input id="recherche" type="search" placeholder="Rechercher…" />
+    <label>Trier
+      <select id="tri">
+        <option value="valeur">Valeur (plus haute)</option>
+        <option value="date">Date (plus récente)</option>
+        <option value="nom">Nom (A → Z)</option>
+      </select>
+    </label>
+  </section>
+
+  <svg id="carte" viewBox="0 0 360 180" role="img" aria-label="Carte des résultats"></svg>
+
+  <p id="compteur" class="muted"></p>
+  <ul id="liste"></ul>
+  <p id="pied" class="muted petit"></p>
+</div>
+
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b6b6b; --line: #e6e6e6;
+    --card: #f7f7f8; --accent: #2563eb; --accent-soft: #dbe7ff;
+  }
+  :root.dark {
+    --bg: #1e1e1e; --fg: #f2f2f2; --muted: #a0a0a0; --line: #333;
+    --card: #2a2a2a; --accent: #6ea0ff; --accent-soft: #23345a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { padding: 14px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  h2 { margin: 0; font-size: 18px; }
+  .muted { color: var(--muted); margin: 2px 0; }
+  .petit { font-size: 12px; }
+  .barre { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; align-items: center; }
+  label { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+  input, select, button {
+    font: inherit; color: var(--fg); background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  }
+  input[type="search"] { flex: 1; min-width: 160px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: wait; }
+  #carte { width: 100%; height: 180px; background: var(--card); border-radius: 10px; display: none; }
+  #carte circle { fill: var(--accent); fill-opacity: .55; stroke: var(--bg); stroke-width: .4; cursor: pointer; }
+  #carte circle.actif { fill: #e11d48; fill-opacity: 1; }
+  #liste { list-style: none; padding: 0; margin: 0; max-height: 340px; overflow-y: auto; }
+  #liste li { border-bottom: 1px solid var(--line); padding: 8px 4px; cursor: pointer; }
+  #liste li:hover, #liste li.actif { background: var(--accent-soft); }
+  .ligne { display: flex; justify-content: space-between; gap: 8px; }
+  .valeur { font-weight: 600; min-width: 44px; text-align: right; }
+  .details { margin-top: 6px; font-size: 13px; color: var(--muted); display: none; }
+  li.actif .details { display: block; }
+  a { color: var(--accent); }
+</style>
+
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  let data = null;
+  let actifId = null;
+  let chargement = false;
+
+  // ---------- Thème clair / sombre fourni par Athena ----------
+  function appliquerTheme() {
+    const theme = window.openai?.theme;
+    document.documentElement.classList.toggle("dark", theme === "dark");
+  }
+
+  // ---------- Données ----------
+  function recevoir(nouvelles) {
+    if (!nouvelles || !Array.isArray(nouvelles.items)) return;
+    data = nouvelles;
+    // On récupère l'élément sélectionné mémorisé, s'il y en a un
+    actifId = window.openai?.widgetState?.actifId ?? null;
+    afficher();
+  }
+
+  async function rappelerOutil(nouveauxArgs) {
+    if (!data?.outil) return;
+    const args = { ...(data.arguments ?? {}), ...nouveauxArgs };
+    if (!window.openai?.callTool) {
+      $("compteur").textContent = "callTool indisponible (hors d'Athena).";
+      return;
+    }
+    chargement = true; majBoutons();
+    $("compteur").textContent = "Récupération des données…";
+    try {
+      const res = await window.openai.callTool(data.outil, args);
+      // Selon l'hôte, les données reviennent dans structuredContent
+      // ou arrivent par l'événement openai:set_globals.
+      if (res?.structuredContent) recevoir(res.structuredContent);
+    } catch (e) {
+      $("compteur").textContent = "Erreur : " + (e?.message ?? e);
+    } finally {
+      chargement = false; majBoutons();
+    }
+  }
+
+  function majBoutons() {
+    $("rafraichir").disabled = chargement;
+    document.querySelectorAll("#controles select").forEach((s) => (s.disabled = chargement));
+  }
+
+  // ---------- Affichage ----------
+  function formatDate(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString("fr-CA", { dateStyle: "medium", timeStyle: "short" });
+  }
+
+  function itemsFiltres() {
+    const q = $("recherche").value.trim().toLowerCase();
+    const tri = $("tri").value;
+    let items = data.items.filter((i) => !q || String(i.nom).toLowerCase().includes(q));
+    items.sort((a, b) => {
+      if (tri === "date") return new Date(b.date) - new Date(a.date);
+      if (tri === "nom") return String(a.nom).localeCompare(String(b.nom), "fr");
+      return (b.valeur ?? -Infinity) - (a.valeur ?? -Infinity);
+    });
+    return items;
+  }
+
+  function afficherControles() {
+    const zone = $("controles");
+    zone.innerHTML = "";
+    for (const c of data.controles ?? []) {
+      const label = document.createElement("label");
+      label.textContent = c.label;
+      const select = document.createElement("select");
+      for (const o of c.options) {
+        const opt = document.createElement("option");
+        opt.value = String(o.value);
+        opt.textContent = o.label;
+        if (String(data.arguments?.[c.name]) === String(o.value)) opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.addEventListener("change", () => {
+        const v = c.type === "number" ? Number(select.value) : select.value;
+        rappelerOutil({ [c.name]: v });
+      });
+      label.appendChild(select);
+      zone.appendChild(label);
+    }
+  }
+
+  function afficherCarte(items) {
+    const svg = $("carte");
+    const geo = items.filter((i) => typeof i.lat === "number" && typeof i.lon === "number");
+    if (!geo.length) { svg.style.display = "none"; return; }
+    svg.style.display = "block";
+    // Projection simple : longitude -> x (0..360), latitude -> y (0..180)
+    const vals = geo.map((i) => i.valeur ?? 0);
+    const max = Math.max(...vals, 1);
+    svg.innerHTML =
+      `<line x1="0" y1="90" x2="360" y2="90" stroke="currentColor" stroke-opacity=".1"/>` +
+      `<line x1="180" y1="0" x2="180" y2="180" stroke="currentColor" stroke-opacity=".1"/>` +
+      geo.map((i) => {
+        const r = 1.5 + 5 * Math.max(0, i.valeur ?? 0) / max;
+        const cls = i.id === actifId ? "actif" : "";
+        return `<circle data-id="${i.id}" class="${cls}" cx="${(i.lon + 180).toFixed(2)}" cy="${(90 - i.lat).toFixed(2)}" r="${r.toFixed(2)}"><title>${echapper(i.nom)} : ${i.valeur ?? ""}</title></circle>`;
+      }).join("");
+    svg.querySelectorAll("circle").forEach((c) =>
+      c.addEventListener("click", () => selectionner(c.dataset.id, true))
+    );
+  }
+
+  function echapper(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+  }
+
+  function afficherListe(items) {
+    const ul = $("liste");
+    ul.innerHTML = items.map((i) => {
+      const details = Object.entries(i.details ?? {})
+        .map(([k, v]) => `<div><strong>${echapper(k)} :</strong> ${echapper(v)}</div>`).join("");
+      const lien = i.lien ? `<div><a href="${echapper(i.lien)}" target="_blank" rel="noopener">Voir la source</a></div>` : "";
+      return `<li data-id="${echapper(i.id)}" class="${i.id === actifId ? "actif" : ""}">
+        <div class="ligne"><span>${echapper(i.nom)}</span><span class="valeur">${i.valeur ?? "–"}</span></div>
+        <div class="muted petit">${formatDate(i.date)}</div>
+        <div class="details">${details}${lien}</div>
+      </li>`;
+    }).join("");
+    ul.querySelectorAll("li").forEach((li) =>
+      li.addEventListener("click", (e) => {
+        if (e.target.tagName === "A") return;
+        selectionner(li.dataset.id, false);
+      })
+    );
+  }
+
+  function selectionner(id, defiler) {
+    actifId = actifId === id ? null : id;
+    window.openai?.setWidgetState?.({ actifId }); // mémorise la sélection
+    afficher();
+    if (defiler && actifId) {
+      document.querySelector(`#liste li[data-id="${CSS.escape(actifId)}"]`)?.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function afficher() {
+    if (!data) return;
+    $("titre").textContent = data.titre ?? "Résultats";
+    $("sousTitre").textContent = `${data.total ?? data.items.length} résultats · ${data.valeurLabel ?? "Valeur"}`;
+    const items = itemsFiltres();
+    $("compteur").textContent = `${items.length} affichés`;
+    afficherControles();
+    afficherCarte(items);
+    afficherListe(items);
+    $("pied").innerHTML = data.source
+      ? `Source : <a href="${echapper(data.sourceUrl)}" target="_blank" rel="noopener">${echapper(data.source)}</a> · récupéré le ${formatDate(data.recupereLe)}`
+      : "";
+    majBoutons();
+  }
+
+  // ---------- Événements ----------
+  $("recherche").addEventListener("input", afficher);
+  $("tri").addEventListener("change", afficher);
+  $("rafraichir").addEventListener("click", () => rappelerOutil({}));
+
+  // Athena envoie cet événement quand toolOutput, le thème, etc. changent
+  window.addEventListener("openai:set_globals", (e) => {
+    appliquerTheme();
+    const g = e.detail?.globals;
+    if (g?.toolOutput) recevoir(g.toolOutput);
+  });
+
+  // Démarrage
+  appliquerTheme();
+  recevoir(window.openai?.toolOutput);
+  if (!data) $("compteur").textContent = "En attente des données de l'outil…";
+</script>
